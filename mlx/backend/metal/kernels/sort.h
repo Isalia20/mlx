@@ -57,6 +57,35 @@ struct LessThan {
   }
 };
 
+// Floats sort as unsigned keys in the same order, with NaN last
+template <typename T, typename = void>
+struct SortKey {
+  using type = T;
+  static METAL_FUNC T to_key(T v, bool) {
+    return v;
+  }
+  static METAL_FUNC T from_key(T k) {
+    return k;
+  }
+};
+
+template <typename T>
+struct SortKey<T, metal::enable_if_t<metal::is_floating_point_v<T>>> {
+  using type = metal::conditional_t<sizeof(T) == 4, uint, ushort>;
+  static constexpr constant type sign = type(1) << (sizeof(T) * 8 - 1);
+  // Argsort keys -0 as +0 so that equal values keep their order
+  static METAL_FUNC type to_key(T v, bool arg_sort) {
+    type b = as_type<type>(arg_sort && v == 0 ? T(0) : v);
+    if (metal::isnan(v)) {
+      return metal::numeric_limits<type>::max();
+    }
+    return (b & sign) ? type(~b) : type(b | sign);
+  }
+  static METAL_FUNC T from_key(type k) {
+    return as_type<T>((k & sign) ? type(k ^ sign) : type(~k));
+  }
+};
+
 template <
     typename ValT,
     typename IdxT,
@@ -253,9 +282,9 @@ template <
     bool ARG_SORT,
     short BLOCK_THREADS,
     short N_PER_THREAD,
-    typename CompareOp = LessThan<T>>
+    typename CompareOp = LessThan<typename SortKey<T>::type>>
 struct KernelMergeSort {
-  using ValT = T;
+  using ValT = typename SortKey<T>::type;
   using IdxT = uint;
   using block_merge_sort_t = BlockMergeSort<
       ValT,
@@ -285,8 +314,9 @@ struct KernelMergeSort {
 
     // Copy into threadgroup memory
     for (short i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
-      tgp_vals[i] = i < size_sorted_axis ? inp[i * in_stride_sorted_axis]
-                                         : ValT(CompareOp::init);
+      tgp_vals[i] = i < size_sorted_axis
+          ? SortKey<T>::to_key(inp[i * in_stride_sorted_axis], ARG_SORT)
+          : ValT(CompareOp::init);
       if (ARG_SORT) {
         tgp_idxs[i] = i;
       }
@@ -304,7 +334,7 @@ struct KernelMergeSort {
       if (ARG_SORT) {
         out[i * out_stride_sorted_axis] = tgp_idxs[i];
       } else {
-        out[i * out_stride_sorted_axis] = tgp_vals[i];
+        out[i * out_stride_sorted_axis] = SortKey<T>::from_key(tgp_vals[i]);
       }
     }
   }
